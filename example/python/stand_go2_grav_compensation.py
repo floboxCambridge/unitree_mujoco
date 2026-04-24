@@ -1,12 +1,17 @@
 import time
 import sys
 import numpy as np
+import mujoco
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_, LowState_
 from unitree_sdk2py.utils.crc import CRC
+
+from threading import Thread
+import threading
+
 
 
 class Go2Controller:
@@ -15,7 +20,33 @@ class Go2Controller:
             ChannelFactoryInitialize(1, "lo")
         else:
             ChannelFactoryInitialize(0, interface)
+        
 
+        self.model_path = '/home/flobox/unitree_mujoco/unitree_robots/go2/go2.xml'
+        try:
+            self.mj_model = mujoco.MjModel.from_xml_path(self.model_path)
+            self.mj_data = mujoco.MjData(self.mj_model)
+            self.use_mujoco = True
+            print(f"Successfully loaded MuJoCo model from {self.model_path}")
+        except Exception as e:
+            print(f"Warning: Failed to load MuJoCo model. Gravity comp disabled. Error: {e}")
+            self.use_mujoco = False
+        self.unitree_joint_names = [
+        "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+        "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+        "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
+        "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+        ]
+        self.joint_ids = [
+            mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            for name in self.unitree_joint_names
+        ]
+
+        self.qpos_adr = np.array([self.mj_model.jnt_qposadr[jid] for jid in self.joint_ids])
+        self.dof_adr = np.array([self.mj_model.jnt_dofadr[jid] for jid in self.joint_ids])
+        print(f"Joint IDs: {self.joint_ids}")
+        print(f"Qpos addresses: {self.qpos_adr}")
+        print(f"Dof addresses: {self.dof_adr}")
         # Low-level joint state
         self.low_state = None
         self.joint_q = np.zeros(12)
@@ -30,11 +61,20 @@ class Go2Controller:
         self.low_state_sub = ChannelSubscriber("rt/lowstate", LowState_)
         self.low_state_sub.Init(self.low_state_handler, 10)
 
+        self.mass = 15.0
+        self.g = 9.81
+
+        self.Fz_per_leg = self.mass * self.g / 4
+
         self.cmd = unitree_go_msg_dds__LowCmd_()
         self.cmd.head[0] = 0xFE
         self.cmd.head[1] = 0xEF
         self.cmd.level_flag = 0xFF
         self.cmd.gpio = 0
+        self.desired_height=np.array([0.3, 0.2, 0.4])
+        self.counter=0
+        self.time_up=10.
+        self.time_down=10.
 
         for i in range(20):
             self.cmd.motor_cmd[i].mode = 0x01
@@ -45,9 +85,9 @@ class Go2Controller:
             self.cmd.motor_cmd[i].tau = 0.0
 
         # VMC parameters
-        self.Kz = 300.0
-        self.Dz = 10.0
-        self.max_tau = 30.0
+        self.Kz = 400.0
+        self.Dz = 100.0
+        self.max_tau = 40.0
 
         self.L_THIGH = 0.213
         self.L_CALF = 0.213
@@ -64,14 +104,18 @@ class Go2Controller:
 
         self.z0_legs = None
         self.start_time = None
+        self.saved_vmc_ref = False
+
+        
 
     def low_state_handler(self, msg: LowState_):
-        print(f"Low state received. IMU: {msg.imu_state}, motor[0] q: {msg.motor_state[0].q}")
         self.low_state = msg
         for i in range(12):
             self.joint_q[i] = msg.motor_state[i].q
             self.joint_dq[i] = msg.motor_state[i].dq
+        self.base_quat = np.array(msg.imu_state.quaternion)
         self.state_received = True
+
 
     def hip_pd_tau(self, q_leg, dq_leg, leg_id):
         q1 = q_leg[0]
@@ -93,41 +137,67 @@ class Go2Controller:
         idx = 3 * leg_id
         return self.joint_dq[idx:idx+3].copy()
 
-    def foot_relative_z(self, q_leg):
+    def foot_relative_xz(self, q_leg):
         _, q2, q3 = q_leg
-        return -self.L_THIGH * np.cos(q2) - self.L_CALF * np.cos(q2 + q3)
+        x = self.L_THIGH * np.sin(q2) + self.L_CALF * np.sin(q2 + q3)
+        z = -self.L_THIGH * np.cos(q2) - self.L_CALF * np.cos(q2 + q3)
+        return np.array([x, z], dtype=float)
+    def compute_feedforward_torques(self):
+        if not self.use_mujoco:
+            return np.zeros(12)
 
-    def jacobian_z(self, q_leg):
+        # Floating base pose
+        self.mj_data.qpos[0:3] = 0.0
+        self.mj_data.qpos[3:7] = self.base_quat
+
+        # Joint states by named addresses
+        self.mj_data.qpos[self.qpos_adr] = self.joint_q
+        self.mj_data.qvel[:] = 0.0
+        self.mj_data.qvel[self.dof_adr] = self.joint_dq
+
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+
+        return self.mj_data.qfrc_bias[self.dof_adr].copy()
+    def jacobian_xz(self, q_leg):
         _, q2, q3 = q_leg
+        dx_dq1 = 0.0
+        dx_dq2 = self.L_THIGH * np.cos(q2) + self.L_CALF * np.cos(q2 + q3)
+        dx_dq3 = self.L_CALF * np.cos(q2 + q3)
         dz_dq1 = 0.0
         dz_dq2 = self.L_THIGH * np.sin(q2) + self.L_CALF * np.sin(q2 + q3)
         dz_dq3 = self.L_CALF * np.sin(q2 + q3)
-        return np.array([dz_dq1, dz_dq2, dz_dq3], dtype=float)
+        Jxz = np.array([
+        [0.0, dx_dq2, dx_dq3],
+        [0.0, dz_dq2, dz_dq3],
+        ], dtype=float)
 
-    def foot_z_velocity(self, q_leg, dq_leg):
-        Jz = self.jacobian_z(q_leg)
-        return Jz @ dq_leg
+        return Jxz
 
-    def smooth_phase(self, t, T=1.):
-        return np.tanh(max(t, 0.0) / T)
+    def foot_xz_velocity(self, q_leg, dq_leg):
+        return self.jacobian_xz(q_leg) @ dq_leg
 
-    def desired_foot_z(self, z0, t, rise_height=0.08, T=1.):
-        s = self.smooth_phase(t, T=T)
-        return z0 - s * rise_height
 
     def desired_foot_dz(self, t):
         return 0.0
 
-    def vmc_leg_tau(self, q_leg, dq_leg, z_des, dz_des):
-        z = self.foot_relative_z(q_leg)
-        dz = self.foot_z_velocity(q_leg, dq_leg)
+    def vmc_leg_tau_2d(self, q_leg, dq_leg, xz_des, dxz_des):
+        xz = self.foot_relative_xz(q_leg)
+        dxz = self.foot_xz_velocity(q_leg, dq_leg)
 
-        Fz = self.Kz * (z_des - z) + self.Dz * (dz_des - dz)
-        Jz = self.jacobian_z(q_leg)
+        K = np.diag([120.0, self.Kz])
+        D = np.diag([6.0, self.Dz])
+        print(f"xz_des: {xz_des}, xz: {xz}")
+        F = K @ (xz_des - xz) + D @ (dxz_des - dxz)
+        F[1]-=self.Fz_per_leg
 
-        tau_leg = Jz * Fz
+        Jxz = self.jacobian_xz(q_leg)
+
+        tau_leg = Jxz.T @ F
+
         tau_leg = np.clip(tau_leg, -self.max_tau, self.max_tau)
-        return tau_leg, z, dz, Fz
+
+
+        return tau_leg, xz, dxz, F
     def set_damping_mode(self, kd_hip=1.0, kd_leg=3.0):
         for leg_id in range(4):
             idx = 3 * leg_id
@@ -160,26 +230,21 @@ class Go2Controller:
         print("Waiting for low state...")
         while not self.state_received:
             time.sleep(0.01)
-        T_stand = 5.0
+        T_stand = 100.0
         print("Low state received.")
         self.fixed=False
-
-        # Save initial foot z for each leg
-        self.z0_legs = np.zeros(4)
-        for leg_id in range(4):
-            q_leg = self.get_leg_q(leg_id)
-            self.z0_legs[leg_id] = self.foot_relative_z(q_leg)
-
         self.start_time = time.perf_counter()
+        
 
         while True:
             step_start = time.perf_counter()
             t = step_start - self.start_time
-            if t > T_stand:
+
+            if t > self.time_up and t < self.time_up + self.time_down:
                 if not self.fixed:
                     self.stand_up_joint_pos = self.joint_q.copy()
                     self.fixed = True
-                phase = np.tanh((t - T_stand) / 1.2)
+                phase = np.tanh((t - self.time_up) / 2.)
                 for i in range(12):
                     self.cmd.motor_cmd[i].q = phase * self.stand_down_joint_pos[i] + (
                         1 - phase) * self.stand_up_joint_pos[i]
@@ -187,28 +252,58 @@ class Go2Controller:
                     self.cmd.motor_cmd[i].dq = 0.0
                     self.cmd.motor_cmd[i].kd = 3.5
                     self.cmd.motor_cmd[i].tau = 0.0
-            else:
-                rise_height = 0.6
-                T=1.
+            elif t < self.time_up:
+                rise_height = self.desired_height[self.counter]
+                T = 1.0
+
+                if not self.saved_vmc_ref:
+                    self.xz0_legs = np.zeros((4, 2))
+
+                    for leg_id in range(4):
+                        q_leg = self.get_leg_q(leg_id)
+                        self.xz0_legs[leg_id] = self.foot_relative_xz(q_leg)
+
+                    self.saved_vmc_ref = True
+                tau_ff_all = self.compute_feedforward_torques()
                 for leg_id in range(4):
                     q_leg = self.get_leg_q(leg_id)
                     dq_leg = self.get_leg_dq(leg_id)
 
-                    z_des = self.desired_foot_z(self.z0_legs[leg_id], t, rise_height=rise_height, T=T)
-                    dz_des = self.desired_foot_dz(t)
+                    xz0 = self.xz0_legs[leg_id]
+
+
+                    x_des = xz0[0]
+                    z_des = -  rise_height
+
+                    xz_des = np.array([x_des, z_des], dtype=float)
+                    dxz_des = np.array([0.0, 0.0], dtype=float)
 
                     tau_hip = self.hip_pd_tau(q_leg, dq_leg, leg_id)
-                    tau_vmc, z, dz, Fz = self.vmc_leg_tau(q_leg, dq_leg, z_des, dz_des)
-                    tau_leg = tau_vmc + tau_hip
+                    tau_vmc, xz, dxz, F = self.vmc_leg_tau_2d(q_leg, dq_leg, xz_des, dxz_des)
+                    idx=3*leg_id
+                    tau_leg = tau_vmc + tau_hip - 0* tau_ff_all[idx : idx+3]
                     tau_leg = np.clip(tau_leg, -self.max_tau, self.max_tau)
-                    idx = 3 * leg_id
+
+
+                    tau_leg = np.clip(tau_leg, -self.max_tau, self.max_tau)
+                    print(f"leg_id: {leg_id}, tau_hip: {tau_hip}, tau_vmc: {tau_vmc}, tau_ff_leg: {tau_ff_all[idx : idx+3]}, tau_leg: {tau_leg}")
                     for j in range(3):
                         self.cmd.motor_cmd[idx + j].q = 0.0
                         self.cmd.motor_cmd[idx + j].kp = 0.0
                         self.cmd.motor_cmd[idx + j].dq = 0.0
                         self.cmd.motor_cmd[idx + j].kd = 0.5
                         self.cmd.motor_cmd[idx + j].tau = float(tau_leg[j])
-                    print(f"Leg {leg_id} tau: {tau_leg}")
+            else:
+                self.counter += 1
+                self.fixed = False
+                self.saved_vmc_ref = False
+                self.start_time = time.perf_counter()
+
+                if self.counter >= len(self.desired_height):
+                    self.set_damping_mode()
+                    self.publish_command()
+                    exit(0)
+
             self.publish_command()
 
             time_until_next_step = 0.002 - (time.perf_counter() - step_start)

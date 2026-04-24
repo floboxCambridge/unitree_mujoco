@@ -12,12 +12,12 @@ from unitree_sdk2py.utils.crc import CRC
 
 def HighStateHandler(msg: SportModeState_):
     print("Position: ", msg.position)
-    #print("Velocity: ", msg.velocity)
+    print("Velocity: ", msg.velocity)
 
 
 def LowStateHandler(msg: LowState_):
-    print("IMU state: ", msg.imu_state)
-    # print("motor[0] state: ", msg.motor_state[0])
+    #print("IMU state: ", msg.imu_state)
+    print("motor[0] state: ", msg.motor_state[0])
 
 
 if __name__ == "__main__":
