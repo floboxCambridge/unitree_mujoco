@@ -1,7 +1,15 @@
 import time
 import sys
+from pathlib import Path
+
 import numpy as np
 import mujoco
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "simulate_python"))
+
+from _unitree_sdk_path import ensure_unitree_sdk2py
+
+ensure_unitree_sdk2py()
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -299,7 +307,10 @@ class Go2Controller:
                 time.sleep(time_until_next_step)
 
 
-input("Press enter to start")
+try:
+    input("Press enter to start")
+except EOFError:
+    print("No interactive stdin available; starting immediately.")
 
 if __name__ == "__main__":
     interface = None if len(sys.argv) < 2 else sys.argv[1]

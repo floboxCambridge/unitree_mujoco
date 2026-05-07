@@ -4,6 +4,10 @@ import mujoco.viewer
 from threading import Thread
 import threading
 
+from _unitree_sdk_path import ensure_unitree_sdk2py
+
+ensure_unitree_sdk2py()
+
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py_bridge import UnitreeSdk2Bridge, ElasticBand
 
