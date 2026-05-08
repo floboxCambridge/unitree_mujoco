@@ -187,7 +187,7 @@ class Go2Controller:
                     F[1] = self.Kz * (self.xz_des_flat[i][1] - xz[1]) - self.Dz * dxz[1]
 
                     # Gravity support only on vertical axis
-                    #F[1] -= fz_dist[i]
+                    F[1] -= fz_dist[i]
 
                     tau_leg = self.jacobian_xz(q_leg).T @ F
 
