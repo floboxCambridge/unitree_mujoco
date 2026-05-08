@@ -63,6 +63,7 @@ class Go2Controller:
         self.time_up = 5.0
         self.cmd = unitree_go_msg_dds__LowCmd_()
         self.cmd.level_flag = 0xFF
+        self.last_print_time = 0.0
 
         # VMC PD Gains
         self.Kx, self.Dx = 180.0, 10.0
@@ -83,7 +84,7 @@ class Go2Controller:
         calf_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "FR_calf")
         self.L_THIGH = np.linalg.norm(self.mj_model.body_pos[calf_id])
         foot_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_SITE, "FR_foot")
-        self.L_CALF = 0.213
+        self.L_CALF = np.linalg.norm(self.mj_model.body_pos[foot_id])
 
     def low_state_handler(self, msg: LowState_):
         for i in range(12):
@@ -92,38 +93,52 @@ class Go2Controller:
         self.state_received = True
 
     def get_level_statics(self):
-        self.mj_data.qpos[0:3] = 0.0
-        self.mj_data.qpos[3:7] = np.array([1.0, 0.0, 0.0, 0.0])
-        self.mj_data.qpos[self.qpos_adr] = self.joint_q
-        mujoco.mj_forward(self.mj_model, self.mj_data)
+        self.mj_data.qpos[0:3] = 0.0 #floating base position x, y, z (absolute position, we don't care about it, we x-care about foot relative position to com)
+        self.mj_data.qpos[3:7] = np.array([1.0, 0.0, 0.0, 0.0])  # floating base orientation (quaternion, we keep it level) by saying no pitch /roll/yaw
+        self.mj_data.qpos[self.qpos_adr] = self.joint_q #copy motors angles
+        mujoco.mj_forward(self.mj_model, self.mj_data)# run forward kinematicsq to compute com and foot positions, otherwisse we were not using it
 
-        com = self.mj_data.subtree_com[1].copy()
+        com = self.mj_data.subtree_com[1].copy() #com of the main body (0 would be the world, 1 is the main body) in world frame (world position)
 
         foot_names = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
         foot_pos = []
         for n in foot_names:
-            sid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_SITE, n)
+            sid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_SITE, n)#site_xpos gives the world position of each site after mj_forward().
             foot_pos.append(self.mj_data.site_xpos[sid].copy())
 
         return com, foot_pos
 
     def compute_fz_distribution(self, com, foot_pos):
-        mg = self.mass * self.g
+        mg = self.mass * self.g #fz_0 + fz_1 + fz_2 + fz_3 = m g but we also want to avoid pitch yaw, roll around COM
         A = np.zeros((3, 4))
+        """
+        # Matrix A maps the 4 unknown foot forces to:
+        #
+        #   row 0: total vertical force
+        #   row 1: pitch-balancing term
+        #   row 2: roll-balancing term
+        #
+        # Shape is 3 x 4 because:
+        #   3 equations
+        #   4 unknown foot forces
 
+        we want 
+        tau_x = y * Fz
+        tau_y = -x * Fz
+        """
         for i in range(4):
-            lever = foot_pos[i] - com
+            lever = foot_pos[i] - com  #get the relative position of each foot to the com, we want to avoid roll/pitch/yaw around com, so we want the sum of lever cross fz to be 0, and the sum of fz to be mg
 
-            A[0, i] = 1.0
-            A[1, i] = lever[0]
-            A[2, i] = lever[1]
+            A[0, i] = 1.0 #sum of vertical forces should equal mg
+            A[1, i] = lever[0] #sum of pitch moments should be 0
+            A[2, i] = -lever[1] #sum of roll moments should be 0
 
         b = np.array([mg, 0.0, 0.0])
 
         fz = np.linalg.pinv(A) @ b
 
         # Avoid negative vertical forces
-        return np.clip(fz, 0.05 * mg / 4.0, mg)
+        return np.clip(fz, 0.05 * mg / 4.0, mg) # we impose a small minimum force to avoid singularities in the control when a foot is lifted, and we also cap the maximum force to mg to avoid unrealistic forces
     def foot_relative_xz(self, q_leg):
         _, q2, q3 = q_leg
         x = self.L_THIGH * np.sin(q2) + self.L_CALF * np.sin(q2 + q3)
@@ -158,20 +173,21 @@ class Go2Controller:
 
                 com, foot_pos = self.get_level_statics()
                 fz_dist = self.compute_fz_distribution(com, foot_pos)
-                
+                leg_errors = []
                 tau_cmd_all = np.zeros(12)
                 for i in range(4):
                     idx = i * 3
                     q_leg, dq_leg = self.joint_q[idx:idx+3], self.joint_dq[idx:idx+3]
                     xz, dxz = self.foot_relative_xz(q_leg), (self.jacobian_xz(q_leg) @ dq_leg)
-                    
+                    err_xz = self.xz_des_flat[i] - xz
+                    leg_errors.append(np.linalg.norm(err_xz))
                     F = np.zeros(2)
 
                     F[0] = self.Kx * (self.xz_des_flat[i][0] - xz[0]) - self.Dx * dxz[0]
                     F[1] = self.Kz * (self.xz_des_flat[i][1] - xz[1]) - self.Dz * dxz[1]
 
                     # Gravity support only on vertical axis
-                    F[1] -= fz_dist[i]
+                    #F[1] -= fz_dist[i]
 
                     tau_leg = self.jacobian_xz(q_leg).T @ F
 
@@ -180,7 +196,18 @@ class Go2Controller:
                     tau_leg[0] += tau_hip
 
                     tau_cmd_all[idx:idx+3] = tau_leg
+                if t - self.last_print_time >= 1.0:
+                    self.last_print_time = t
 
+                    mean_err = np.mean(leg_errors)
+                    max_err = np.max(leg_errors)
+
+                    print(
+                        f"[{t:.1f}s] Foot distance to target | "
+                        f"mean={mean_err*1000:.1f} mm, max={max_err*1000:.1f} mm | "
+                        f"FR={leg_errors[0]*1000:.1f}, FL={leg_errors[1]*1000:.1f}, "
+                        f"RR={leg_errors[2]*1000:.1f}, RL={leg_errors[3]*1000:.1f} mm"
+                    )
                 tau_cmd_all = np.clip(tau_cmd_all, -self.tau_limits, self.tau_limits)
                 for i in range(12):
                     self.cmd.motor_cmd[i].q, self.cmd.motor_cmd[i].kp = 0.0, 0.0
