@@ -66,16 +66,14 @@ class Go2Controller:
         self.last_print_time = 0.0
 
         # VMC PD Gains
-        self.Kx, self.Dx = 180.0, 10.0
-        self.Ky, self.Dy = 250.0, 12.0
-        self.Kz, self.Dz = 400.0, 25.0
+        self.Kx, self.Dx = 180.0, 20.0
+        self.Ky, self.Dy = 250.0, 25.0
+        self.Kz, self.Dz = 400.0, 50.0
         self.tau_limits = np.array([23.0, 23.0, 40.0] * 4)
 
         
         self.stand_down_joint_pos = np.array([0.04, 1.22, -2.44] * 4)
         self.stand_up_joint_pos_target = np.array([0.0, 0.67, -1.3] * 4)
-
-        self.xyz_des_flat = None 
         self.start_time = None
 
         self.imu_quat = np.array([1.0, 0.0, 0.0, 0.0])
@@ -103,8 +101,29 @@ class Go2Controller:
 
             self.foot_body_ids.append(bid)
 
-        print("Foot body ids:", dict(zip(self.foot_body_names, self.foot_body_ids)))
-        
+
+
+        print("Foot body ids:", dict(zip(self.foot_body_names, self.foot_body_ids)))   
+        # Desired body heights in meters.
+        # Since feet are below the body, desired foot z = -height.
+        self.height_sequence = [ 0.30, 0.35, 0.2]
+        self.height_period = 10.0          # change height every 10 seconds
+        self.height_transition_time = 3.0  # smooth transition duration
+
+        self.vmc_start_time = None
+
+        # This will store the nominal x/y foot positions.
+        # z will be replaced dynamically depending on desired height.
+        self.xyz_nominal_flat = None 
+    def smoothstep(self, s):
+        """
+        Smooth interpolation from 0 to 1.
+
+        s should be between 0 and 1.
+        This avoids sudden jumps in desired height.
+        """
+        s = np.clip(s, 0.0, 1.0)
+        return s * s * (3.0 - 2.0 * s)
     def print_mujoco_names_containing(self, text):
         print(f"\nMuJoCo names containing '{text}':")
 
@@ -125,6 +144,58 @@ class Go2Controller:
             name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, i)
             if name and text.lower() in name.lower():
                 print(f"  geom {i}: {name}")
+    def get_desired_height(self, t_vmc):
+        """
+        Return desired body height as a function of time.
+
+        Heights cycle like this:
+
+            0-10s    : 20 cm
+            10-20s   : transition/stay toward 30 cm
+            20-30s   : transition/stay toward 35 cm
+            30-40s   : transition/stay toward 20 cm
+            repeat...
+
+        The transition is smoothed during the first few seconds of each 10s block.
+        """
+
+        heights = self.height_sequence
+        n = len(heights)
+
+        block = int(t_vmc // self.height_period)
+        phase_time = t_vmc - block * self.height_period
+
+        current_idx = block % n
+        next_idx = (block + 1) % n
+
+        h0 = heights[current_idx]
+        h1 = heights[next_idx]
+
+        # Only transition during the first self.height_transition_time seconds.
+        s = phase_time / self.height_transition_time
+        alpha = self.smoothstep(s)
+
+        return h0 #(1-alpha) * h0 + alpha * h1
+    def get_desired_foot_targets(self, desired_height):
+        """
+        Build desired foot positions for all four legs.
+
+        x and y come from the nominal stand-up pose.
+        z is changed according to desired body height.
+
+        Because the foot is below the body:
+
+            foot_z_des = -desired_height
+        """
+
+        targets = []
+
+        for i in range(4):
+            target = self.xyz_nominal_flat[i].copy()
+            target[2] = -desired_height
+            targets.append(target)
+
+        return targets
     def _extract_robot_geometry(self):
         thigh_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "FR_thigh")
         calf_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "FR_calf")
@@ -221,10 +292,6 @@ class Go2Controller:
             for name, lev in zip(["FR", "FL", "RR", "RL"], levers):
                 print(f"  {name}: x={lev[0]:+.3f}, y={lev[1]:+.3f}")
 
-            print("A =")
-            print(A)
-            print("b =", b)
-            print("raw fz =", fz)
 
         min_fz = 0.03 * mg / 4.0
         max_fz = 0.70 * mg
@@ -309,16 +376,22 @@ class Go2Controller:
                     self.cmd.motor_cmd[i].kp, self.cmd.motor_cmd[i].kd = (phase*60 + 20), 3.5
                     self.cmd.motor_cmd[i].tau = 0.0
             else:
-                if self.xyz_des_flat is None:
-                    self.xyz_des_flat = [
+                if self.xyz_nominal_flat is None:
+                    self.xyz_nominal_flat = [
                         self.foot_relative_xyz(self.stand_up_joint_pos_target[i*3:i*3+3])
                         for i in range(4)
                     ]
-                    print("3D VMC + Gravity Compensation Active.")
 
+                    self.vmc_start_time = t
+
+                    print("3D VMC + Gravity Compensation Active.")
+                    print("Height sequence active: 20 cm -> 30 cm -> 35 cm, changing every 10 s.")
+                t_vmc = t - self.vmc_start_time
+
+                desired_height = self.get_desired_height(t_vmc)
+                xyz_des = self.get_desired_foot_targets(desired_height)
                 com, foot_pos = self.get_level_statics()
                 roll, pitch, yaw = self.rpy_from_quat(self.imu_quat)
-
                 roll_rate = self.imu_gyro[0]
                 pitch_rate = self.imu_gyro[1]
 
@@ -335,13 +408,14 @@ class Go2Controller:
                     idx = i * 3
                     q_leg, dq_leg = self.joint_q[idx:idx+3], self.joint_dq[idx:idx+3]
                     xyz, dxyz = self.foot_relative_xyz(q_leg), (self.jacobian_xyz(q_leg) @ dq_leg)
-                    err_xyz = self.xyz_des_flat[i] - xyz
+                    err_xyz = xyz_des[i] - xyz
                     leg_errors.append(np.linalg.norm(err_xyz))
+
                     F = np.zeros(3)
 
-                    F[0] = self.Kx * (self.xyz_des_flat[i][0] - xyz[0]) - self.Dx * dxyz[0]
-                    F[1] = self.Ky * (self.xyz_des_flat[i][1] - xyz[1]) - self.Dy * dxyz[1]
-                    F[2] = self.Kz * (self.xyz_des_flat[i][2] - xyz[2]) - self.Dz * dxyz[2]
+                    F[0] = self.Kx * err_xyz[0] - self.Dx * dxyz[0]
+                    F[1] = self.Ky * err_xyz[1] - self.Dy * dxyz[1]
+                    F[2] = self.Kz * err_xyz[2] - self.Dz * dxyz[2]
 
 
 
@@ -360,6 +434,7 @@ class Go2Controller:
 
                     print(
                     f"[{t:.1f}s] "
+                    f"height_des={desired_height*100:.1f} cm, "
                     f"pitch={np.degrees(pitch):+.2f} deg, "
                     f"tau_pitch_des={tau_pitch_des:+.2f} Nm | "
                     f"fz=({fz_dist[0]:.1f}, {fz_dist[1]:.1f}, {fz_dist[2]:.1f}, {fz_dist[3]:.1f}) N | "
