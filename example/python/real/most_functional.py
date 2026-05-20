@@ -43,7 +43,7 @@ class Go2Controller:
             self.mj_data = mujoco.MjData(self.mj_model)
 
             self._extract_robot_geometry()
-            self.mass =  0.9* float(np.sum(self.mj_model.body_mass))
+            self.mass =  float(np.sum(self.mj_model.body_mass))
 
             self.joint_ids = [
                 mujoco.mj_name2id(
@@ -81,7 +81,7 @@ class Go2Controller:
         self.imu_gyro = np.zeros(3)
 
         self.roll_ref = 0.0
-        self.pitch_ref = 0.0 * np.pi/180
+        self.pitch_ref = 0.0
 
         self.start_joint_pos = np.zeros(12)
         self.damping_started = False
@@ -97,20 +97,15 @@ class Go2Controller:
 
         self.time_up = 5.0
         self.stand_down_duration = 2.0
-        self.damping_duration = 2.
+        self.damping_duration = 0.5
         self.control_phase = "ramp"
-
-        self.K_com_x = 200.0
-        self.D_com_x = 15.0
-        self.max_com_fx = 50.0
-        self.prev_com_x = None
 
         # ------------------------------------------------------------
         # VMC PD gains: kept identical to stand_go2_grav_compensation.py.
         # ------------------------------------------------------------
         self.Kx, self.Dx = 90.0, 10.0
         self.Ky, self.Dy = 125.0, 12.0
-        self.Kz, self.Dz = 250.0, 10.0
+        self.Kz, self.Dz = 600.0, 15.0
 
         self.K_roll_body = 25.0
         self.D_roll_body = 2.0
@@ -151,8 +146,8 @@ class Go2Controller:
         # ------------------------------------------------------------
         # Desired body heights: kept identical to stand_go2_grav_compensation.py.
         # ------------------------------------------------------------
-        self.height_sequence = [0.30]
-        self.height_period = 100.0          # change height every 10 seconds
+        self.height_sequence = [0.30, 0.2, 0.35]
+        self.height_period = 10.0          # change height every 10 seconds
         self.height_transition_time = 3.0  # smooth transition duration
         self.vmc_cycle_duration = self.height_period * len(self.height_sequence)
 
@@ -594,13 +589,6 @@ class Go2Controller:
         z = z0 * np.cos(q1)
 
         return np.array([x, y, z])
-    def distribute_fx_weighted(self, Fx_total, fz_dist):
-        """
-        Distribute horizontal force proportional to vertical load.
-        This is safer for contact because loaded legs receive more horizontal force.
-        """
-        weights = fz_dist / max(1e-6, np.sum(fz_dist))
-        return Fx_total * weights
     def jacobian_xyz(self, q_leg):
         """
         Analytical Jacobian of foot position:
@@ -696,52 +684,7 @@ class Go2Controller:
 
                     tau_roll_des = self.K_roll_body * roll_err - self.D_roll_body * roll_rate
                     tau_pitch_des = self.K_pitch_body * pitch_err - self.D_pitch_body * pitch_rate
-                    # First compute nominal vertical support without horizontal correction.
-                    fz_dist = self.compute_fz_distribution(
-                        com,
-                        foot_pos,
-                        tau_roll_des,
-                        tau_pitch_des,
-                    )
-
-                    # COM x spring-damper.
-                    foot_center_x = np.mean([p[0] for p in foot_pos])
-                    com_x = com[0]
-                    x_err_com = foot_center_x - com_x
-
-                    if self.prev_com_x is None:
-                        com_vx = 0.0
-                    else:
-                        dt_com = max(1e-4, t - self.prev_com_time)
-                        com_vx = (com_x - self.prev_com_x) / dt_com
-
-                    self.prev_com_x = com_x
-                    self.prev_com_time = t
-
-                    Fx_total_com = self.K_com_x * x_err_com - self.D_com_x * com_vx
-                    Fx_total_com = np.clip(Fx_total_com, -self.max_com_fx, self.max_com_fx)
-
-                    # Distribute horizontal force over loaded feet.
-                    Fx_leg = self.distribute_fx_weighted(Fx_total_com, fz_dist)
-
-                    # Estimate pitch moment created by horizontal forces.
-                    # r x F, pitch/y component = z*Fx - x*Fz.
-                    # Here only the horizontal part:
-                    tau_pitch_from_fx = 0.0
-                    for i in range(4):
-                        lever = foot_pos[i] - com
-                        tau_pitch_from_fx += lever[2] * Fx_leg[i]
-
-                    # Recompute vertical load distribution to cancel this pitch contribution.
-                    fz_dist = self.compute_fz_distribution(
-                        com,
-                        foot_pos,
-                        tau_roll_des,
-                        tau_pitch_des - tau_pitch_from_fx,
-                    )
-
-                    # Recompute Fx distribution with updated fz.
-                    Fx_leg = self.distribute_fx_weighted(Fx_total_com, fz_dist)
+                    fz_dist = self.compute_fz_distribution(com, foot_pos, tau_roll_des, tau_pitch_des)
                     leg_errors = []
                     tau_cmd_all = np.zeros(12)
                     R_body_to_world = self.quat_to_rotmat(self.imu_quat)
@@ -775,19 +718,8 @@ class Go2Controller:
                         F_pd[0] = self.Kx * err_xyz[0] - self.Dx * dxyz[0]
                         F_pd[1] = self.Ky * err_xyz[1] - self.Dy * dxyz[1]
                         F_pd[2] = self.Kz * err_xyz[2] - self.Dz * dxyz[2]
-                        f_perturb=0.
-                        if t>20.0 and t<25.0:
-                            if i==2 or i==3:
-                                f_perturb = 30.0
-                        F_world_grav = np.array([0.0, 0.0, -fz_dist[i] + f_perturb])
 
-                        # Sign may need flipping after testing.
-                        F_world_com = np.array([Fx_leg[i], 0.0, 0.0])
-
-                        F_world_total = F_world_grav + F_world_com
-                        F_body_total = R_body_to_world.T @ F_world_total
-
-                        F = F_body_total
+                        F_world_grav = np.array([0.0, 0.0, -fz_dist[i]])
                         F_body_grav = R_body_to_world.T @ F_world_grav
 
                         # Ramp only the corrective part, not the support part.
@@ -826,10 +758,6 @@ class Go2Controller:
                         f"RR=({tau_cmd_all[6]:.1f}, {tau_cmd_all[7]:.1f}, {tau_cmd_all[8]:.1f}), "
                         f"RL=({tau_cmd_all[9]:.1f}, {tau_cmd_all[10]:.1f}, {tau_cmd_all[11]:.1f})"
                         f"torque_ramp={torque_ramp:.3f}"
-                        f"com_x={com_x:+.3f}, foot_cx={foot_center_x:+.3f}, "
-                        f"x_err_com={x_err_com*1000:+.1f} mm, "
-                        f"Fx_total={Fx_total_com:+.1f} N, "
-                        f"tau_pitch_fx={tau_pitch_from_fx:+.2f} Nm | "
                     )
                     
                     tau_raw = tau_cmd_all.copy()
