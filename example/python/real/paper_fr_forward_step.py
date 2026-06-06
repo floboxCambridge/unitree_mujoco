@@ -30,16 +30,15 @@ class Go2FRForwardStepController:
             ChannelFactoryInitialize(0, interface)
 
         self.model_path = Path(__file__).resolve().parents[3] / "unitree_robots/go2/go2.xml"
-        self.unitree_joint_names = [
+        self.unitree_joint_names = [ #from mujoco model names
             "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
             "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
             "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
             "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
         ]
-        self.leg_names = ["FR", "FL", "RR", "RL"]
+        self.leg_names = ["FR", "FL", "RR", "RL"] #for control purposes
         self.leg_index = {name: idx for idx, name in enumerate(self.leg_names)}
-        self.swing_leg = "FR"
-        self.support_legs = ["FL", "RR", "RL"]
+        self.swing_sequence = ["FR"]
 
         self.mj_model = mujoco.MjModel.from_xml_path(str(self.model_path))
         self.mj_data = mujoco.MjData(self.mj_model)
@@ -58,33 +57,33 @@ class Go2FRForwardStepController:
         ]
 
         self.dt = 0.002
-        self.time_up = 5.0
-        self.stand_down_joint_pos = np.array([0.04, 1.22, -2.44] * 4)
+        self.time_up = 5.0 #time for the robot to rise
+        self.stand_down_joint_pos = np.array([0.04, 1.22, -2.44] * 4) #positions extracted from the provided default code for standing robot
         self.stand_up_joint_pos_target = np.array([0.0, 0.67, -1.3] * 4)
 
-        self.roll_des = 0.0
+        self.roll_des = 0.0 #desired positions at equilibrium
         self.pitch_des = 0.0
         self.yaw_des = 0.0
         self.x_des = 0.0
         self.y_des = 0.0
-        self.z_des = 0.30
+        self.z_des = 0.30 #desired standing height
 
-        self.nominal_x_des = 0.0
+        self.nominal_x_des = 0.0 #position of the com after the walk
         self.nominal_y_des = 0.0
-        self.shift_x_des = -0.04
+        self.shift_x_des = -0.08 #shifting of the com after the walk
         self.shift_y_des = 0.035
 
         self.initial_stabilize_duration = 2.5
         self.com_shift_duration = 3.
         self.fr_lift_duration = 0.5
-        self.fr_hold_duration = 0.2
+        self.fr_hold_duration = 0.2 #hold the leg in the air, maybe not necessary
         self.fr_step_duration = 0.8
         self.final_stabilize_duration = 3.0
 
         # Negative x is forward in this leg frame. Keep the COM shift aligned
         # so the support legs carry the body while the FR foot reaches ahead.
-        self.step_delta_x = -0.15
-        self.swing_lift_height = 0.08
+        self.step_delta_x = -0.1 #new relative x position of the foot
+        self.swing_lift_height = 0.15 #height during the carrying phase
         self.body_tau_limit = 30.0
         self.swing_tau_limit = 30.0
 
@@ -93,9 +92,19 @@ class Go2FRForwardStepController:
         self.state_received = False
         self.phase_announced = None
 
-        self.swing_home = None
-        self.swing_lifted = None
-        self.swing_forward = None
+        self.swing_home = {}
+        self.swing_lifted = {}
+        self.swing_forward = {}
+
+        self.Kx = 500.
+        self.Dx =10.
+        self.Ky = 450.
+        self.Dy = 14.
+        self.Kz = 2000.
+        self.Dz = 12.
+        self.Kyaw = 35.
+        self.Dyaw = 3.
+        self.horizontal_force_limit = 60.0
 
         self.joint_q = np.zeros(12)
         self.joint_dq = np.zeros(12)
@@ -116,7 +125,7 @@ class Go2FRForwardStepController:
         else:
             print("Simulation mode: skipping MotionSwitcherClient/SportClient release.")
 
-    def _extract_robot_geometry(self):
+    def _extract_robot_geometry(self): #extract measurement for FK from mujoco model
         thigh_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "FR_thigh")
         calf_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "FR_calf")
         foot_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_SITE, "FR_foot")
@@ -124,7 +133,7 @@ class Go2FRForwardStepController:
         self.L_THIGH = np.linalg.norm(self.mj_model.body_pos[calf_id])
         self.L_CALF = np.linalg.norm(self.mj_model.body_pos[foot_id])
 
-    def init_low_cmd(self):
+    def init_low_cmd(self): #init the state receiver 
         self.cmd.head[0] = 0xFE
         self.cmd.head[1] = 0xEF
         self.cmd.level_flag = 0xFF
@@ -137,15 +146,15 @@ class Go2FRForwardStepController:
             self.cmd.motor_cmd[i].kd = 0.0
             self.cmd.motor_cmd[i].tau = 0.0
 
-    def low_state_handler(self, msg: LowState_):
+    def low_state_handler(self, msg: LowState_): #takes care of the state receiver
         for i in range(12):
             self.joint_q[i] = msg.motor_state[i].q
             self.joint_dq[i] = msg.motor_state[i].dq
         self.imu_quat[:] = msg.imu_state.quaternion
         self.imu_gyro[:] = msg.imu_state.gyroscope
-        self.state_received = True
+        self.state_received = True   
 
-    def release_motion_mode(self):
+    def release_motion_mode(self): #release the control via the remote for interfacing with the robot
         self.sc = SportClient()
         self.sc.SetTimeout(5.0)
         self.sc.Init()
@@ -164,7 +173,7 @@ class Go2FRForwardStepController:
             status, result = self.msc.CheckMode()
         print("Motion mode released.")
 
-    def get_level_statics(self):
+    def get_level_statics(self): #receive state informations and store them
         self.mj_data.qpos[0:3] = 0.0
         self.mj_data.qpos[3:7] = self.imu_quat
         self.mj_data.qpos[self.qpos_adr] = self.joint_q
@@ -173,7 +182,7 @@ class Go2FRForwardStepController:
         foot_pos = [self.mj_data.xpos[bid].copy() for bid in self.foot_body_ids]
         return com, foot_pos
 
-    def compute_whole_body_com(self):
+    def compute_whole_body_com(self): #compute the position of the center of mass in a relative frame 
         masses = self.mj_model.body_mass
         xpos = self.mj_data.xipos
         total_mass = np.sum(masses[1:])
@@ -184,7 +193,7 @@ class Go2FRForwardStepController:
         foot_mean = np.mean(np.array(foot_positions), axis=0)
         return com - foot_mean
 
-    def fk_leg(self, q, leg_name):
+    def fk_leg(self, q, leg_name): #forward kinematics controller
         q1, q2, q3 = q
         side = -1.0 if leg_name in ["FR", "RR"] else 1.0
         x = self.L_THIGH * np.sin(q2) + self.L_CALF * np.sin(q2 + q3)
@@ -195,7 +204,7 @@ class Go2FRForwardStepController:
         z -= self.L_CALF * np.cos(q1) * np.cos(q2 + q3)
         return np.array([x, y, z])
 
-    def jacobian_leg(self, q):
+    def jacobian_leg(self, q): #obtained by analytical derivation of the fk model 
         q1, q2, q3 = q
         s1, c1 = np.sin(q1), np.cos(q1)
         s2, c2 = np.sin(q2), np.cos(q2)
@@ -214,7 +223,7 @@ class Go2FRForwardStepController:
             ],
         ])
 
-    def quat_to_rpy(self, quat):
+    def quat_to_rpy(self, quat): #maps the quaternion measurements into the rotation along euler frame 
         w, x, y, z = quat
         t0 = 2.0 * (w * x + y * z)
         t1 = 1.0 - 2.0 * (x * x + y * y)
@@ -225,6 +234,9 @@ class Go2FRForwardStepController:
         t4 = 1.0 - 2.0 * (y * y + z * z)
         yaw = np.arctan2(t3, t4)
         return roll, pitch, yaw
+
+    def angle_error(self, target, measured):
+        return np.arctan2(np.sin(target - measured), np.cos(target - measured))
 
     def compute_body_wrench(self):
         com = self.estimate_com_position()
@@ -237,18 +249,21 @@ class Go2FRForwardStepController:
         self.prev_com = com.copy()
         self.prev_time = now
 
-        roll, pitch, _yaw = self.quat_to_rpy(self.imu_quat)
+        roll, pitch, yaw = self.quat_to_rpy(self.imu_quat)
         roll_error = self.roll_des - roll
         pitch_error = self.pitch_des - pitch
+        yaw_error = self.angle_error(self.yaw_des, yaw)
 
-        fx = 350.0 * (self.x_des - com[0]) - 12.0 * com_vel[0]
-        fy = 450.0 * (self.y_des - com[1]) - 14.0 * com_vel[1]
-        fz = self.mass * 9.81 + 2200.0 * (self.z_des - com[2]) - 12.0 * com_vel[2]
+
+        fx = self.Kx * (self.x_des - com[0]) - self.Dx * com_vel[0] # PD controller for position of the COM
+        fy = self.Ky * (self.y_des - com[1]) - self.Dy * com_vel[1]
+        fz = self.mass * 9.81 + self.Kz * (self.z_des - com[2]) - self.Dz * com_vel[2] #just try with smaller gain for kz
         tx = 140.0 * roll_error - 10.0 * self.imu_gyro[0]
         ty = 140.0 * pitch_error - 10.0 * self.imu_gyro[1]
-        return -fx, fy, fz, tx, ty
+        tz = 0. * yaw_error - 0. * self.imu_gyro[2]
+        return -fx, fy, fz, tx, ty, tz
 
-    def distribute_vertical_forces(self, total_fz, tx, ty, com, foot_positions, stance_legs):
+    def distribute_vertical_forces(self, total_fz, tx, ty, com, foot_positions, stance_legs): #solve lqr problem to find how to distribute vertical force  and the torques not around the vertical axis on the stance legs
         stance_ids = [self.leg_index[leg] for leg in stance_legs]
         A = []
         for idx in stance_ids:
@@ -263,68 +278,92 @@ class Go2FRForwardStepController:
             vertical[leg] = force
         return vertical
 
-    def compute_stance_torques(self, stance_legs):
+    def distribute_horizontal_forces(self, total_fx, total_fy, tz, com, foot_positions, stance_legs):
+        stance_ids = [self.leg_index[leg] for leg in stance_legs]
+        A = np.zeros((3, 2 * len(stance_ids)))
+        for col, idx in enumerate(stance_ids):
+            r = foot_positions[idx] - com
+            A[0, 2 * col] = 1.0
+            A[1, 2 * col + 1] = 1.0
+            A[2, 2 * col] = -r[1]
+            A[2, 2 * col + 1] = r[0]
+        b = np.array([total_fx, total_fy, tz])
+        raw = np.linalg.pinv(A) @ b
+        raw = np.clip(raw, -self.horizontal_force_limit, self.horizontal_force_limit)
+        horizontal = {leg: np.zeros(2) for leg in self.leg_names}
+        for col, leg in enumerate(stance_legs):
+            horizontal[leg] = raw[2 * col:2 * col + 2]
+        return horizontal
+
+    def compute_stance_torques(self, stance_legs): #computes torque for the stance legs
         com, foot_positions = self.get_level_statics()
-        fx, fy, fz, tx, ty = self.compute_body_wrench()
+        fx, fy, fz, tx, ty, tz = self.compute_body_wrench()
         vertical = self.distribute_vertical_forces(fz, tx, ty, com, foot_positions, stance_legs)
+        horizontal = self.distribute_horizontal_forces(fx, fy, tz, com, foot_positions, stance_legs)
         tau_all = np.zeros(12)
-        nstance = float(len(stance_legs))
 
         for leg in stance_legs:
             idx = 3 * self.leg_index[leg]
             q_leg = self.joint_q[idx:idx + 3]
-            J = self.jacobian_leg(q_leg)
-            foot_force = np.array([fx / nstance, fy / nstance, vertical[leg]])
+            J = self.jacobian_leg(q_leg) #vmc 
+            foot_force = np.array([horizontal[leg][0], horizontal[leg][1], vertical[leg]]) #we need to apply "special" force on z axis to avoid unbalance
             tau_all[idx:idx + 3] = -J.T @ foot_force
 
         return np.clip(tau_all, -self.body_tau_limit, self.body_tau_limit)
 
-    def swing_foot_torque(self, leg, target_pos):
+    def swing_foot_torque(self, leg, target_pos): #computes torque to swinging leg (try to lift two at the same time)
         idx = 3 * self.leg_index[leg]
         q_leg = self.joint_q[idx:idx + 3]
         dq_leg = self.joint_dq[idx:idx + 3]
         p_leg = self.fk_leg(q_leg, leg)
         J = self.jacobian_leg(q_leg)
         v_leg = J @ dq_leg
-        kp =3 * np.diag([220.0, 90.0, 260.0])
-        kd = np.diag([8.0, 6.0, 8.0])
+        kp =3 * np.diag([50.0, 20.0, 100.0])
+        kd = np.diag([8.0, 4.0, 10.0])
         force = kp @ (target_pos - p_leg) - kd @ v_leg
-        tau = J.T @ force
+        tau = J.T @ force #vmc
         return np.clip(tau, -self.swing_tau_limit, self.swing_tau_limit)
 
-    def interpolate(self, start, end, alpha):
+    def interpolate(self, start, end, alpha): #try to remove (or decrease interpolation period)
         alpha = np.clip(alpha, 0.0, 1.0)
-        return (1.0 - alpha) * start + alpha * end
+        return end
 
-    def get_swing_phase_target(self, phase_name, phase_time):
-        if self.swing_home is None:
-            idx = 3 * self.leg_index[self.swing_leg]
-            self.swing_home = self.fk_leg(self.joint_q[idx:idx + 3], self.swing_leg)
-            self.swing_lifted = self.swing_home + np.array([0.0, 0.0, self.swing_lift_height])
-            self.swing_forward = self.swing_home + np.array([self.step_delta_x, 0.0, 0.0])
+    def support_legs_for(self, swing_leg):
+        return [leg for leg in self.leg_names if leg != swing_leg]
 
-        if phase_name == "fr_lift":
+    def shift_y_for(self, swing_leg):
+        # Positive y shifts away from right legs, negative y shifts away from left legs.
+        return abs(self.shift_y_des) if swing_leg in ["FR", "RR"] else -abs(self.shift_y_des)
+
+    def get_swing_phase_target(self, swing_leg, phase_name, phase_time): #defines target positions for VMC  only when one leg in the air
+        if swing_leg not in self.swing_home:
+            idx = 3 * self.leg_index[swing_leg]
+            self.swing_home[swing_leg] = self.fk_leg(self.joint_q[idx:idx + 3], swing_leg) # determines the position of the leg in relative frame before swinging
+            self.swing_lifted[swing_leg] = self.swing_home[swing_leg] + np.array([0.0, 0.0, self.swing_lift_height]) #position to lift the leg
+            self.swing_forward[swing_leg] = self.swing_home[swing_leg] + np.array([self.step_delta_x, 0.0, 0.0]) # position at touchdown
+
+        if phase_name == "lift": #finding the interpolation point for each phase
             alpha = phase_time / self.fr_lift_duration
-            return self.interpolate(self.swing_home, self.swing_lifted, alpha)
-        if phase_name == "fr_hold":
-            return self.swing_lifted
-        if phase_name == "fr_step":
+            return self.interpolate(self.swing_home[swing_leg], self.swing_lifted[swing_leg], alpha)
+        if phase_name == "hold":
+            return self.swing_lifted[swing_leg]
+        if phase_name == "step":
             alpha = phase_time / self.fr_step_duration
-            target = self.interpolate(self.swing_lifted, self.swing_forward, alpha)
-            if alpha < 0.8:
-                target[2] = self.swing_lifted[2]
-            else:
-                touchdown_alpha = (alpha - 0.8) / 0.2
-                target[2] = self.interpolate(self.swing_lifted[2], self.swing_forward[2], touchdown_alpha)
+            target = self.interpolate(self.swing_lifted[swing_leg], self.swing_forward[swing_leg], alpha)
             return target
         return None
 
-    def announce_phase(self, name):
+    def add_swing_torque(self, tau_all, swing_leg, phase_name, phase_time):
+        swing_target = self.get_swing_phase_target(swing_leg, phase_name, phase_time)
+        idx = 3 * self.leg_index[swing_leg]
+        tau_all[idx:idx + 3] = self.swing_foot_torque(swing_leg, swing_target)
+
+    def announce_phase(self, name): #for printing the current phase
         if self.phase_announced != name:
             print(f"phase -> {name}")
             self.phase_announced = name
 
-    def command_stand_pose(self, phase):
+    def command_stand_pose(self, phase): #for the initiation  (when the robpot slowly rises)
         for i in range(12):
             self.cmd.motor_cmd[i].mode = 0x01
             self.cmd.motor_cmd[i].q = phase * self.stand_up_joint_pos_target[i] + (1.0 - phase) * self.stand_down_joint_pos[i]
@@ -336,12 +375,12 @@ class Go2FRForwardStepController:
     def apply_tau_command(self, tau_all, posture_kp=4.0, posture_kd=1.2):
         for i in range(12):
             self.cmd.motor_cmd[i].mode = 0x01
-            self.cmd.motor_cmd[i].q = self.stand_up_joint_pos_target[i]
+            self.cmd.motor_cmd[i].q = self.stand_up_joint_pos_target[i] #for init
             self.cmd.motor_cmd[i].dq = 0.0
             self.cmd.motor_cmd[i].kp = posture_kp
             self.cmd.motor_cmd[i].kd = posture_kd
-            self.cmd.motor_cmd[i].tau = tau_all[i]
-    def send_damping_command(self, kd=2.0):
+            self.cmd.motor_cmd[i].tau = tau_all[i] #for vmc
+    def send_damping_command(self, kd=2.0): #return to damping safe after end of experiment/emergency stop
         """
         Damping-only mode.
 
@@ -359,7 +398,7 @@ class Go2FRForwardStepController:
             self.cmd.motor_cmd[i].dq = 0.
             self.cmd.motor_cmd[i].kd = kd
             self.cmd.motor_cmd[i].tau = 0.0
-    def send_zero_torque(self):
+    def send_zero_torque(self): #to end the execution safely
         for i in range(20):
             self.cmd.motor_cmd[i].mode = 0x01
             self.cmd.motor_cmd[i].q = 0.
@@ -372,7 +411,7 @@ class Go2FRForwardStepController:
         self.pub.Write(self.cmd)
     def run(self):
         print("Waiting for state...")
-        while not self.state_received:
+        while not self.state_received: #begin only if contact established with the robot
             time.sleep(0.01)
 
         start_time = time.perf_counter()
@@ -381,8 +420,7 @@ class Go2FRForwardStepController:
         while True:
             t = time.perf_counter()
             elapsed = t - start_time
-
-            if elapsed < self.time_up:
+            if elapsed < self.time_up: #first phase:ruse if the robot
                 self.announce_phase("stand_up")
                 phase = np.tanh(elapsed / 1.5)
                 self.command_stand_pose(phase)
@@ -390,59 +428,78 @@ class Go2FRForwardStepController:
                 seq_t = t - sequence_start
                 tau_all = np.zeros(12)
 
-                if seq_t < self.initial_stabilize_duration:
+                leg_sequence_duration = (
+                    self.com_shift_duration
+                    + self.fr_lift_duration
+                    + self.fr_hold_duration
+                    + self.fr_step_duration
+                    + self.final_stabilize_duration
+                )
+
+                if seq_t < self.initial_stabilize_duration: #four legs just switch to vmc controller (position control to torque control)
                     self.announce_phase("four_leg_stabilize")
                     self.x_des = self.nominal_x_des
                     self.y_des = self.nominal_y_des
                     tau_all = self.compute_stance_torques(self.leg_names)
-                elif seq_t < self.initial_stabilize_duration + self.com_shift_duration:
-                    self.announce_phase("com_shift_away_from_fr")
-                    phase_t = seq_t - self.initial_stabilize_duration
-                    alpha = phase_t / self.com_shift_duration
-                    self.x_des = self.interpolate(self.nominal_x_des, self.shift_x_des, alpha)
-                    self.y_des = self.interpolate(self.nominal_y_des, self.shift_y_des, alpha)
-                    tau_all = self.compute_stance_torques(self.leg_names)
-                elif seq_t < self.initial_stabilize_duration + self.com_shift_duration + self.fr_lift_duration:
-                    self.announce_phase("fr_lift")
-                    self.x_des = self.shift_x_des
-                    self.y_des = self.shift_y_des
-                    phase_t = seq_t - self.initial_stabilize_duration - self.com_shift_duration
-                    tau_all = self.compute_stance_torques(self.support_legs)
-                    swing_target = self.get_swing_phase_target("fr_lift", phase_t)
-                    idx = 3 * self.leg_index[self.swing_leg]
-                    tau_all[idx:idx + 3] = self.swing_foot_torque(self.swing_leg, swing_target)
-                elif seq_t < self.initial_stabilize_duration + self.com_shift_duration + self.fr_lift_duration + self.fr_hold_duration:
-                    self.announce_phase("fr_hold")
-                    self.x_des = self.shift_x_des
-                    self.y_des = self.shift_y_des
-                    tau_all = self.compute_stance_torques(self.support_legs)
-                    swing_target = self.get_swing_phase_target("fr_hold", 0.0)
-                    idx = 3 * self.leg_index[self.swing_leg]
-                    tau_all[idx:idx + 3] = self.swing_foot_torque(self.swing_leg, swing_target)
-                elif seq_t < self.initial_stabilize_duration + self.com_shift_duration + self.fr_lift_duration + self.fr_hold_duration + self.fr_step_duration:
-                    self.announce_phase("fr_step_forward")
-                    self.x_des = self.shift_x_des
-                    self.y_des = self.shift_y_des
-                    phase_t = seq_t - self.initial_stabilize_duration - self.com_shift_duration - self.fr_lift_duration - self.fr_hold_duration
-                    tau_all = self.compute_stance_torques(self.support_legs)
-                    swing_target = self.get_swing_phase_target("fr_step", phase_t)
-                    idx = 3 * self.leg_index[self.swing_leg]
-                    tau_all[idx:idx + 3] = self.swing_foot_torque(self.swing_leg, swing_target)
-                else:
-                    self.announce_phase("four_leg_restabilize")
-                    alpha = min(
-                        (
-                            seq_t
-                            - self.initial_stabilize_duration
+                elif seq_t < self.initial_stabilize_duration + len(self.swing_sequence) * leg_sequence_duration:
+                    sequence_t = seq_t - self.initial_stabilize_duration
+                    swing_idx = int(sequence_t // leg_sequence_duration)
+                    swing_leg = self.swing_sequence[swing_idx]
+                    leg_t = sequence_t - swing_idx * leg_sequence_duration
+                    shift_y_des = self.shift_y_for(swing_leg)
+                    support_legs = self.support_legs_for(swing_leg)
+
+                    if leg_t < self.com_shift_duration: #preparing for moving
+                        self.announce_phase(f"com_shift_away_from_{swing_leg.lower()}")
+                        self.Kx =350.
+                        self.Dx = 10.
+                        alpha = leg_t / self.com_shift_duration
+                        self.x_des = self.interpolate(self.nominal_x_des, self.shift_x_des, alpha)
+                        self.y_des = self.interpolate(self.nominal_y_des, shift_y_des, alpha)
+                        tau_all = self.compute_stance_torques(self.leg_names) #assumes all the legs
+                    elif leg_t < self.com_shift_duration + self.fr_lift_duration:
+                        self.announce_phase(f"{swing_leg.lower()}_lift")
+                        self.x_des = self.shift_x_des
+                        self.y_des = shift_y_des
+                        phase_t = leg_t - self.com_shift_duration
+                        tau_all = self.compute_stance_torques(support_legs)
+                        self.add_swing_torque(tau_all, swing_leg, "lift", phase_t)
+                    elif leg_t < self.com_shift_duration + self.fr_lift_duration + self.fr_hold_duration:
+                        self.announce_phase(f"{swing_leg.lower()}_hold")
+                        self.x_des = self.shift_x_des
+                        self.y_des = shift_y_des
+                        tau_all = self.compute_stance_torques(support_legs)
+                        self.add_swing_torque(tau_all, swing_leg, "hold", 0.0)
+                    elif leg_t < self.com_shift_duration + self.fr_lift_duration + self.fr_hold_duration + self.fr_step_duration:
+                        self.announce_phase(f"{swing_leg.lower()}_step_forward")
+                        self.x_des = -self.step_delta_x/4
+                        self.y_des = shift_y_des
+                        self.Kx =20.
+                        self.Dx = 2.
+                        phase_t = leg_t - self.com_shift_duration - self.fr_lift_duration - self.fr_hold_duration
+                        tau_all = self.compute_stance_torques(support_legs)
+                        self.add_swing_torque(tau_all, swing_leg, "step", phase_t)
+                    else:
+                        self.announce_phase(f"four_leg_restabilize_after_{swing_leg.lower()}")
+                        self.Kx =350.
+                        self.Dx = 10.
+                        phase_t = (
+                            leg_t
                             - self.com_shift_duration
                             - self.fr_lift_duration
                             - self.fr_hold_duration
                             - self.fr_step_duration
-                        ) / self.final_stabilize_duration,
-                        1.0,
-                    )
-                    self.x_des = self.interpolate(self.shift_x_des, self.nominal_x_des, alpha)
-                    self.y_des = self.interpolate(self.shift_y_des, self.nominal_y_des, alpha)
+                        )
+                        alpha = min(phase_t / self.final_stabilize_duration, 1.0)
+                        self.x_des = self.interpolate(self.shift_x_des, self.nominal_x_des, alpha)
+                        self.y_des = self.interpolate(shift_y_des, self.nominal_y_des, alpha)
+                        tau_all = self.compute_stance_torques(self.leg_names)
+                else:
+                    self.announce_phase("four_leg_restabilize")
+                    self.Kx =350.
+                    self.Dx = 10.
+                    self.x_des = self.nominal_x_des
+                    self.y_des = self.nominal_y_des
                     tau_all = self.compute_stance_torques(self.leg_names)
 
                 self.apply_tau_command(tau_all)
@@ -456,7 +513,7 @@ class Go2FRForwardStepController:
 
 
 if __name__ == "__main__":
-    sim = False
+    sim = True
     args = [arg for arg in sys.argv[1:] if arg != "--sim"]
     interface = args[0] if args else None
 
@@ -467,7 +524,7 @@ if __name__ == "__main__":
     controller = Go2FRForwardStepController(interface=interface, sim=sim)
     try:
         controller.run()
-    except KeyboardInterrupt:
+    except KeyboardInterrupt: #in case of emergency stop
         print("\nShutdown.")
 
         start_time_shutdown = time.perf_counter()
@@ -488,4 +545,4 @@ if __name__ == "__main__":
 
             time.sleep(controller.dt)
 
-        controller.send_zero_torque()
+        controller.send_zero_torque() #ends program

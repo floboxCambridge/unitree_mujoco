@@ -2,6 +2,10 @@ import sys
 import time
 from pathlib import Path
 
+from runtime_bootstrap import ensure_project_python
+
+ensure_project_python(("numpy", "mujoco", "cyclonedds"))
+
 import mujoco
 import numpy as np
 
@@ -335,7 +339,7 @@ class Go2Controller:
     def compute_VMC(self):
         com_x, com_y, com_z = self.estimate_com_position()
         roll_error, pitch_error, yaw_error, ed_roll, ed_pitch, ed_yaw = self.attitude_errors()
-        kz = 3000.0
+        kz = 2000.0
         dz = 10.0
         if self.prev_com_x is not None and self.prev_com_y is not None and self.prev_com_z is not None and self.prev_time is not None:
             dt = time.perf_counter() - self.prev_time
