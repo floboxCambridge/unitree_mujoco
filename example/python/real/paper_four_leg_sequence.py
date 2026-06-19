@@ -42,8 +42,8 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
         if self.swing_home is None:
             idx = 3 * self.leg_index[leg_name]
             self.swing_home = self.fk_leg(self.joint_q[idx:idx + 3], leg_name)
-            self.swing_lifted = self.swing_home + [0.0, 0.0, self.swing_lift_height]
-            self.swing_forward = self.swing_home + [self.step_delta_x, 0.0, 0.0]
+            self.swing_lifted = self.swing_home + np.array([0.0, 0.0, self.swing_lift_height])
+            self.swing_forward = self.swing_home + np.array([self.step_delta_x, 0.0, 0.0])
 
         if phase_name == "lift":
             alpha = phase_time / self.fr_lift_duration

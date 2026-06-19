@@ -81,7 +81,9 @@ class Go2FRForwardStepController:
         self.fr_step_duration = 0.8
         self.final_stabilize_duration = 3.0
 
-        self.step_delta_x = -0.1
+        # Negative x is forward in this leg frame. Keep the COM shift aligned
+        # so the support legs carry the body while the FR foot reaches ahead.
+        self.step_delta_x = -0.2
         self.swing_lift_height = 0.08
         self.body_tau_limit = 30.0
         self.swing_tau_limit = 30.0
@@ -454,7 +456,7 @@ class Go2FRForwardStepController:
 
 
 if __name__ == "__main__":
-    sim = True
+    sim = False
     args = [arg for arg in sys.argv[1:] if arg != "--sim"]
     interface = args[0] if args else None
 
