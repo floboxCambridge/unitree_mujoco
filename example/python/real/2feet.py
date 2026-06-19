@@ -127,6 +127,13 @@ class Go2Controller:
         self.x_des=0.#might need to adjut the COM position when moving legs
         self.y_des=0.
         self.z_des=0.3
+        self.nominal_x_des = 0.0
+        self.nominal_y_des = 0.0
+        self.front_com_shift_x = -0.04
+        self.rear_com_shift_x = 0.04
+        self.right_com_shift_y = 0.035
+        self.left_com_shift_y = -0.035
+        self.swing_step_delta_x = -0.14
 
         ## 2 legs balance parameters
         self.last_debug_print = 10.
@@ -193,6 +200,7 @@ class Go2Controller:
 
         self.stance_legs = stance_legs
         self.swing_legs = swing_legs
+        self.x_des, self.y_des = self.desired_com_shift_for_swing_legs(swing_legs)
 
         # Important: force reinitialization of swing targets
         self.two_leg_mode_initialized = False
@@ -202,6 +210,29 @@ class Go2Controller:
         self.prev_com_y = None
         self.prev_com_z = None
         self.prev_time = None
+    def desired_com_shift_for_swing_legs(self, swing_legs):
+        if not swing_legs:
+            return self.nominal_x_des, self.nominal_y_des
+
+        front_swing = sum(leg in ["FR", "FL"] for leg in swing_legs)
+        rear_swing = sum(leg in ["RR", "RL"] for leg in swing_legs)
+        right_swing = sum(leg in ["FR", "RR"] for leg in swing_legs)
+        left_swing = sum(leg in ["FL", "RL"] for leg in swing_legs)
+
+        x_des = self.nominal_x_des
+        y_des = self.nominal_y_des
+
+        if front_swing and not rear_swing:
+            x_des = self.front_com_shift_x
+        elif rear_swing and not front_swing:
+            x_des = self.rear_com_shift_x
+
+        if right_swing and not left_swing:
+            y_des = self.right_com_shift_y
+        elif left_swing and not right_swing:
+            y_des = self.left_com_shift_y
+
+        return x_des, y_des
     def compute_four_leg_vmc_torques(self):
         com_pos, foot_pos = self.get_level_statics()
         Fx, Fy, Fz, Tx, Ty, Tz = self.compute_VMC()
@@ -310,8 +341,8 @@ class Go2Controller:
 
             p_target = p_now.copy()
             print(f"swing target before {leg}: {p_target}")
-            p_target[0] -= 0.1
-            p_target[2] += 0.0
+            p_target[0] += self.swing_step_delta_x
+            p_target[2] += lift_height
 
             self.swing_target_pos[leg] = p_target
             print(f"swing target after{leg}: {p_target}")

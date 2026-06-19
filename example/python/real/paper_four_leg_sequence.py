@@ -1,14 +1,14 @@
 import time
 
 import numpy as np
-
+import sys
 from paper_fr_forward_step import Go2FRForwardStepController
 
 
 class Go2FourLegSequenceController(Go2FRForwardStepController):
     def __init__(self, interface=None, sim=True):
         super().__init__(interface=interface, sim=sim)
-        self.step_sequence = ["FR", "FL", "RL", "RR"]
+        self.step_sequence = ["FR", "FL", "RR", "RL"]
         self.swing_lift_height = 0.07
         self.initial_stabilize_duration = 2.5
         self.inter_leg_stabilize_duration = 1.5
@@ -19,11 +19,17 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
         self.swing_lifted = None
         self.swing_forward = None
         self.active_leg_slot = None
+        self.active_shift_target = None
+        self.restabilize_hold_ratio = 0.35
+        self.last_leg_com_shift_duration = 4.0
+        self.last_leg_restabilize_hold_ratio = 0.6
+        self.last_leg_step_scale = 0.65
 
     def reset_swing_targets(self):
         self.swing_home = None
         self.swing_lifted = None
         self.swing_forward = None
+        self.active_shift_target = None
 
     def desired_shift_for_leg(self, leg_name):
         if leg_name in ["FR", "RR"]:
@@ -38,12 +44,62 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
 
         return shift_x, shift_y
 
+    def is_last_sequence_leg(self, leg_name):
+        return leg_name == self.step_sequence[-1]
+
+    def uses_conservative_transfer(self, leg_name):
+        return leg_name == "RR" or self.is_last_sequence_leg(leg_name)
+
+    def com_shift_duration_for_leg(self, leg_name):
+        if self.uses_conservative_transfer(leg_name):
+            return self.last_leg_com_shift_duration
+        return self.com_shift_duration
+
+    def restabilize_hold_ratio_for_leg(self, leg_name):
+        if self.uses_conservative_transfer(leg_name):
+            return self.last_leg_restabilize_hold_ratio
+        return self.restabilize_hold_ratio
+
+    def step_delta_for_leg(self, leg_name):
+        if self.uses_conservative_transfer(leg_name):
+            return self.step_delta_x * self.last_leg_step_scale
+        return self.step_delta_x
+
+    def compute_support_shift_target(self, swing_leg, support_legs):
+        static_shift = np.array(self.desired_shift_for_leg(swing_leg), dtype=float)
+        _com, foot_positions = self.get_level_statics()
+        foot_positions = np.array(foot_positions)
+        all_feet_mean = np.mean(foot_positions, axis=0)
+        support_points = np.array([foot_positions[self.leg_index[leg]] for leg in support_legs])
+        support_centroid = np.mean(support_points, axis=0)
+        dynamic_shift = support_centroid[:2] - all_feet_mean[:2]
+
+        swing_point = foot_positions[self.leg_index[swing_leg]]
+        away_from_swing = support_centroid[:2] - swing_point[:2]
+        away_norm = np.linalg.norm(away_from_swing)
+        if away_norm > 1e-6:
+            if self.uses_conservative_transfer(swing_leg):
+                margin = min(0.03, 0.35 * away_norm)
+            else:
+                margin = min(0.015, 0.2 * away_norm)
+            dynamic_shift += margin * away_from_swing / away_norm
+
+        if self.uses_conservative_transfer(swing_leg):
+            blended_shift = 0.15 * static_shift + 0.85 * dynamic_shift
+            blended_shift[0] = np.clip(blended_shift[0], -0.075, 0.075)
+            blended_shift[1] = np.clip(blended_shift[1], -0.075, 0.075)
+        else:
+            blended_shift = 0.35 * static_shift + 0.65 * dynamic_shift
+            blended_shift[0] = np.clip(blended_shift[0], -0.06, 0.06)
+            blended_shift[1] = np.clip(blended_shift[1], -0.06, 0.06)
+        return blended_shift
+
     def get_swing_phase_target_for_leg(self, leg_name, phase_name, phase_time):
         if self.swing_home is None:
             idx = 3 * self.leg_index[leg_name]
             self.swing_home = self.fk_leg(self.joint_q[idx:idx + 3], leg_name)
             self.swing_lifted = self.swing_home + np.array([0.0, 0.0, self.swing_lift_height])
-            self.swing_forward = self.swing_home + np.array([self.step_delta_x, 0.0, 0.0])
+            self.swing_forward = self.swing_home + np.array([self.step_delta_for_leg(leg_name), 0.0, 0.0])
 
         if phase_name == "lift":
             alpha = phase_time / self.fr_lift_duration
@@ -63,8 +119,9 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
 
     def leg_cycle_duration(self, leg_slot):
         restabilize_duration = self.final_stabilize_duration if leg_slot == len(self.step_sequence) - 1 else self.inter_leg_stabilize_duration
+        swing_leg = self.step_sequence[leg_slot]
         return (
-            self.com_shift_duration
+            self.com_shift_duration_for_leg(swing_leg)
             + self.fr_lift_duration
             + self.fr_hold_duration
             + self.fr_step_duration
@@ -125,16 +182,20 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
 
                     swing_leg = self.step_sequence[leg_slot]
                     support_legs = [leg for leg in self.leg_names if leg != swing_leg]
-                    shift_x, shift_y = self.desired_shift_for_leg(swing_leg)
+                    if self.active_shift_target is None:
+                        self.active_shift_target = self.compute_support_shift_target(swing_leg, support_legs)
+                    shift_x, shift_y = self.active_shift_target
+                    com_shift_duration = self.com_shift_duration_for_leg(swing_leg)
+                    restabilize_hold_ratio = self.restabilize_hold_ratio_for_leg(swing_leg)
 
-                    phase_shift_end = self.com_shift_duration
+                    phase_shift_end = com_shift_duration
                     phase_lift_end = phase_shift_end + self.fr_lift_duration
                     phase_hold_end = phase_lift_end + self.fr_hold_duration
                     phase_step_end = phase_hold_end + self.fr_step_duration
 
                     if leg_time < phase_shift_end:
                         self.announce_phase(f"{swing_leg}_com_shift")
-                        alpha = leg_time / self.com_shift_duration
+                        alpha = leg_time / com_shift_duration
                         self.x_des = self.interpolate(self.nominal_x_des, shift_x, alpha)
                         self.y_des = self.interpolate(self.nominal_y_des, shift_y, alpha)
                         tau_all = self.compute_stance_torques(self.leg_names)
@@ -167,8 +228,13 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
                     else:
                         self.announce_phase(f"{swing_leg}_restabilize")
                         alpha = (leg_time - phase_step_end) / restabilize_duration
-                        self.x_des = self.interpolate(shift_x, self.nominal_x_des, alpha)
-                        self.y_des = self.interpolate(shift_y, self.nominal_y_des, alpha)
+                        if alpha < restabilize_hold_ratio:
+                            self.x_des = shift_x
+                            self.y_des = shift_y
+                        else:
+                            settle_alpha = (alpha - restabilize_hold_ratio) / (1.0 - restabilize_hold_ratio)
+                            self.x_des = self.interpolate(shift_x, self.nominal_x_des, settle_alpha)
+                            self.y_des = self.interpolate(shift_y, self.nominal_y_des, settle_alpha)
                         tau_all = self.compute_stance_torques(self.leg_names)
                 elif seq_t < total_sequence_duration + self.sequence_done_hold:
                     self.announce_phase("sequence_complete_hold")
@@ -190,9 +256,8 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
 
 
 if __name__ == "__main__":
-    import sys
 
-    sim = "--real" not in sys.argv
+    sim = True
     args = [arg for arg in sys.argv[1:] if arg != "--sim" and arg != "--real"]
     interface = args[0] if args else None
 

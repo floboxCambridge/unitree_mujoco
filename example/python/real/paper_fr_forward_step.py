@@ -456,7 +456,7 @@ class Go2FRForwardStepController:
 
 
 if __name__ == "__main__":
-    sim = False
+    sim = True
     args = [arg for arg in sys.argv[1:] if arg != "--sim"]
     interface = args[0] if args else None
 
