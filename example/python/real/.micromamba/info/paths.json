@@ -1,0 +1,31 @@
+{
+  "paths": [
+    {
+      "_path": "bin/micromamba",
+      "file_mode": "binary",
+      "path_type": "hardlink",
+      "prefix_placeholder": "/home/conda/feedstock_root/build_artifacts/micromamba_1780948888554/_h_env_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_placehold_",
+      "sha256": "9689782d863c05a1bf5d2d371ba527104e7a4eb4310c1637d8653b751aed9c82",
+      "size_in_bytes": 18054656
+    },
+    {
+      "_path": "lib/cmake/libmamba-spdlog/libmamba-spdlogConfig.cmake",
+      "path_type": "hardlink",
+      "sha256": "e5a4507e7a57091570af9900bc2dec5d4d5a7cc2b31e50457b9e5294eca062d2",
+      "size_in_bytes": 1052
+    },
+    {
+      "_path": "lib/cmake/libmamba-spdlog/libmamba-spdlogTargets.cmake",
+      "path_type": "hardlink",
+      "sha256": "8864f36fc95263abb14cbb01b103ead00c0f85c1372187dcc9169107d601287b",
+      "size_in_bytes": 5102
+    },
+    {
+      "_path": "lib/cmake/libmamba-spdlog/libmamba-spdlogVersion.cmake",
+      "path_type": "hardlink",
+      "sha256": "82ba3b0b0200e1332ceaec3bd2b350a7cc074ebcc4abf6b769a5ba65d76134e0",
+      "size_in_bytes": 1859
+    }
+  ],
+  "paths_version": 1
+}

@@ -1,0 +1,11 @@
+prefix=/home/neurodesk/unitree_mujoco/example/python/real/.mambaenv
+exec_prefix=/home/neurodesk/unitree_mujoco/example/python/real/.mambaenv
+libdir=/home/neurodesk/unitree_mujoco/example/python/real/.mambaenv/lib
+includedir=/home/neurodesk/unitree_mujoco/example/python/real/.mambaenv/include
+
+Name: uuid
+Description: Universally unique id library
+Version: 2.42.2
+Cflags: -I${includedir}/uuid
+Libs.private:  -lpthread
+Libs: -L${libdir} -luuid

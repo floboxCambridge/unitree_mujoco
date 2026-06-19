@@ -5,6 +5,12 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "simulate_python"))
+
+from _unitree_sdk_path import ensure_unitree_sdk2py
+
+ensure_unitree_sdk2py()
+
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_
@@ -22,7 +28,7 @@ class Go2Controller:
         else:
             ChannelFactoryInitialize(0, interface)
 
-        self.model_path = Path.home() / "unitree_mujoco/unitree_robots/go2/go2.xml"
+        self.model_path = Path(__file__).resolve().parents[3] / "unitree_robots/go2/go2.xml"
 
         self.unitree_joint_names = [
             "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
@@ -787,12 +793,15 @@ class Go2Controller:
                 time.sleep(self.dt - elapsed)
 
 if __name__ == "__main__":
-    print("WARNING: REAL ROBOT LOW-LEVEL CONTROL.")
-    input("Press Enter to continue...")
+    sim = "--sim" in sys.argv[1:]
+    args = [arg for arg in sys.argv[1:] if arg != "--sim"]
+    interface = args[0] if args else None
 
-    interface = sys.argv[1] if len(sys.argv) > 1 else None
+    if not sim:
+        print("WARNING: REAL ROBOT LOW-LEVEL CONTROL.")
+        input("Press Enter to continue...")
 
-    controller = Go2Controller(interface=interface, sim=True)
+    controller = Go2Controller(interface=interface, sim=sim)
 
     try:
         controller.run()
