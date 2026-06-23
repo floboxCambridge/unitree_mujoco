@@ -24,7 +24,7 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
         self.last_leg_com_shift_duration = 4.0
         self.last_leg_restabilize_hold_ratio = 0.6
         self.last_leg_step_scale = 0.65
-        self.step_delta_x = -0.30
+        self.step_delta_x = -0.05
 
     def reset_swing_targets(self):
         self.swing_home = None
@@ -85,14 +85,10 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
                 margin = min(0.015, 0.2 * away_norm)
             dynamic_shift += margin * away_from_swing / away_norm
 
-        if self.uses_conservative_transfer(swing_leg):
-            blended_shift = 0.15 * static_shift + 0.85 * dynamic_shift
-            blended_shift[0] = np.clip(blended_shift[0], -0.075, 0.075)
-            blended_shift[1] = np.clip(blended_shift[1], -0.075, 0.075)
-        else:
-            blended_shift = 0.35 * static_shift + 0.65 * dynamic_shift
-            blended_shift[0] = np.clip(blended_shift[0], -0.06, 0.06)
-            blended_shift[1] = np.clip(blended_shift[1], -0.06, 0.06)
+        
+        blended_shift = 0.15 * static_shift + 0.85 * dynamic_shift
+        blended_shift[0] = np.clip(blended_shift[0], -0.075, 0.075)
+        blended_shift[1] = np.clip(blended_shift[1], -0.075, 0.075)
         return blended_shift
 
     def get_swing_phase_target_for_leg(self, leg_name, phase_name, phase_time):
