@@ -83,7 +83,7 @@ class Go2FRForwardStepController:
 
         # Negative x is forward in this leg frame. Keep the COM shift aligned
         # so the support legs carry the body while the FR foot reaches ahead.
-        self.step_delta_x = -0.2
+        self.step_delta_x = -0.15
         self.swing_lift_height = 0.08
         self.body_tau_limit = 30.0
         self.swing_tau_limit = 30.0
@@ -286,7 +286,7 @@ class Go2FRForwardStepController:
         p_leg = self.fk_leg(q_leg, leg)
         J = self.jacobian_leg(q_leg)
         v_leg = J @ dq_leg
-        kp = np.diag([220.0, 90.0, 260.0])
+        kp =3 * np.diag([220.0, 90.0, 260.0])
         kd = np.diag([8.0, 6.0, 8.0])
         force = kp @ (target_pos - p_leg) - kd @ v_leg
         tau = J.T @ force
@@ -456,7 +456,7 @@ class Go2FRForwardStepController:
 
 
 if __name__ == "__main__":
-    sim = True
+    sim = False
     args = [arg for arg in sys.argv[1:] if arg != "--sim"]
     interface = args[0] if args else None
 

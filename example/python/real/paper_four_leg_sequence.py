@@ -24,6 +24,7 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
         self.last_leg_com_shift_duration = 4.0
         self.last_leg_restabilize_hold_ratio = 0.6
         self.last_leg_step_scale = 0.65
+        self.step_delta_x = -0.30
 
     def reset_swing_targets(self):
         self.swing_home = None
@@ -127,6 +128,35 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
             + self.fr_step_duration
             + restabilize_duration
         )
+    def send_damping_command(self, kd=2.0):
+        """
+        Damping-only mode.
+
+        This does not command a joint position.
+        It only damps joint velocity.
+
+        On the real robot this is much safer than abruptly sending zero torque,
+        because the legs do not go completely passive instantly.
+        """
+
+        for i in range(20):
+            self.cmd.motor_cmd[i].mode = 0x01
+            self.cmd.motor_cmd[i].q = 0.
+            self.cmd.motor_cmd[i].kp = 0.0
+            self.cmd.motor_cmd[i].dq = 0.
+            self.cmd.motor_cmd[i].kd = kd
+            self.cmd.motor_cmd[i].tau = 0.0
+    def send_zero_torque(self):
+        for i in range(20):
+            self.cmd.motor_cmd[i].mode = 0x01
+            self.cmd.motor_cmd[i].q = 0.
+            self.cmd.motor_cmd[i].kp = 0.0
+            self.cmd.motor_cmd[i].dq = 0.
+            self.cmd.motor_cmd[i].kd = 0.0
+            self.cmd.motor_cmd[i].tau = 0.0
+
+        self.cmd.crc = self.crc.Crc(self.cmd)
+        self.pub.Write(self.cmd)
 
     def run(self):
         print("Waiting for state...")
@@ -242,8 +272,22 @@ class Go2FourLegSequenceController(Go2FRForwardStepController):
                     self.y_des = self.nominal_y_des
                     tau_all = self.compute_stance_torques(self.leg_names)
                 else:
-                    print("Completed four-leg sequence.")
-                    return
+                    self.announce_phase("Sequence completed: four_leg_restabilize")
+                    alpha = min(
+                        (
+                            seq_t
+                            - self.initial_stabilize_duration
+                            - self.com_shift_duration
+                            - self.fr_lift_duration
+                            - self.fr_hold_duration
+                            - self.fr_step_duration
+                        ) / self.final_stabilize_duration,
+                        1.0,
+                    )
+                    self.x_des = self.interpolate(self.shift_x_des, self.nominal_x_des, alpha)
+                    self.y_des = self.interpolate(self.shift_y_des, self.nominal_y_des, alpha)
+                    tau_all = self.compute_stance_torques(self.leg_names)
+
 
                 self.apply_tau_command(tau_all)
 
@@ -270,3 +314,24 @@ if __name__ == "__main__":
         controller.run()
     except KeyboardInterrupt:
         print("\nShutdown.")
+
+        start_time_shutdown = time.perf_counter()
+
+        while time.perf_counter() - start_time_shutdown < 3.0:
+            t_shutdown = time.perf_counter() - start_time_shutdown
+
+            # Start damped, then reduce smoothly
+            kd_start = 2.0
+            kd_end = 0.3
+            alpha = min(t_shutdown / 3.0, 1.0)
+
+            kd = (1.0 - alpha) * kd_start + alpha * kd_end
+
+            controller.send_damping_command(kd=kd)
+            controller.cmd.crc = controller.crc.Crc(controller.cmd)
+            controller.pub.Write(controller.cmd)
+
+            time.sleep(controller.dt)
+
+        controller.send_zero_torque()
+
